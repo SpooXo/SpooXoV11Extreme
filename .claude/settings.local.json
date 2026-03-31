@@ -4,7 +4,12 @@
       "Bash(npx localtunnel:*)",
       "Bash(ipconfig)",
       "Bash(node -c \"/c/Users/lepur/SpooXoV11Extreme/index.html\")",
-      "Bash(curl -s http://127.0.0.1:8000)"
+      "Bash(curl -s http://127.0.0.1:8000)",
+      "Bash(timeout 5 python3 << 'EOF'\nimport socket\ntry:\n    s = socket.socket\\(socket.AF_INET, socket.SOCK_DGRAM\\)\n    s.connect\\(\\(\"8.8.8.8\", 80\\)\\)\n    ip = s.getsockname\\(\\)[0]\n    print\\(f\"Local IP: {ip}\"\\)\n    s.close\\(\\)\nexcept Exception as e:\n    print\\(f\"Error: {e}\"\\)\nEOF)",
+      "Bash(curl -s http://127.0.0.1:8000/index.html)",
+      "Bash(git config:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ]
   }
 }

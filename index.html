@@ -81,6 +81,9 @@ class AppState extends EventEmitter {
       unrealizedPnl: 0,
       distanceToTp: null,
       distanceToSl: null,
+      isTrailing: false,
+      trailingLevel: 0,      // şu anki seviye (1, 2, 3...)
+      trailingStop: 0,       // kapat eşiği (level × 0.70)
     };
     this.setState({ positions: [...this._s.positions, pos] });
     return pos;
@@ -276,6 +279,9 @@ function alertTpHit()         { _beep({freq:880,duration:80,volume:0.5}); setTim
 function alertSlHit()         { _beep({freq:440,duration:150,volume:0.5,type:'square'}); setTimeout(()=>_beep({freq:330,duration:200,volume:0.45,type:'square'}),170); _vib([200,100,200]); }
 function alertSlWarning()     { _beep({freq:550,duration:100,volume:0.5,type:'square'}); setTimeout(()=>_beep({freq:440,duration:120,volume:0.5,type:'square'}),140); _vib([150,80,150]); }
 function alertTargetReached() { [523,659,784,1047].forEach((f,i)=>setTimeout(()=>_beep({freq:f,duration:150,volume:0.6}),i*160)); _vib([100,50,100,50,100,50,400]); }
+function alertTrailingStart()  { _beep({freq:1200,duration:80,volume:0.5}); setTimeout(()=>_beep({freq:1200,duration:80,volume:0.5}),100); _vib([100,50,100]); }
+function alertTrailingLevel()  { _beep({freq:1100,duration:90,volume:0.5}); setTimeout(()=>_beep({freq:1100,duration:90,volume:0.5}),110); _vib([120,60,120]); }
+function alertTrailingClose()  { _beep({freq:1320,duration:80,volume:0.6}); setTimeout(()=>_beep({freq:1320,duration:80,volume:0.6}),100); setTimeout(()=>_beep({freq:1320,duration:100,volume:0.6}),200); _vib([100,50,100,50,200]); }
 function alertDisconnected()  { _beep({freq:220,duration:300,volume:0.3,type:'sawtooth'}); _vib(50); }
 
 function flashGreen() {
@@ -479,20 +485,46 @@ function startTracking() {
     if (!matching.length) return;
 
     matching.forEach(pos => {
-      // TP/SL kontrolü
-      const hitTp = pos.side==='LONG' ? price>=pos.tp : price<=pos.tp;
-      const hitSl = pos.side==='LONG' ? price<=pos.sl : price>=pos.sl;
+      // Trailing mode kontrolü (basamaklı)
+      if (pos.isTrailing) {
+        const { unrealizedPnl } = calcLivePnl(pos, price);
+        const newLevel = Math.floor(unrealizedPnl);
 
-      if (hitTp) { alertTpHit(); flashGreen(); _closePos(pos, price, 'tp'); return; }
-      if (hitSl) { alertSlHit(); _closePos(pos, price, 'sl'); return; }
+        // Seviye atladı mı? (basamak yükselişi)
+        if (newLevel > pos.trailingLevel && newLevel > 0) {
+          alertTrailingLevel();
+          const newStop = _r(newLevel * 0.70, 2);
+          state.setState({ positions: state.get('positions').map(x =>
+            x.id===pos.id ? {...x, trailingLevel: newLevel, trailingStop: newStop} : x
+          ) });
+        }
 
-      // SL %20 yakınlık uyarısı
-      const slTotal = Math.abs(pos.entry - pos.sl);
-      const dsl     = pos.distanceToSl ?? slTotal;
-      if (!_slWarnFired[pos.id] && slTotal>0 && dsl/slTotal < 0.2) {
-        _slWarnFired[pos.id] = true;
-        alertSlWarning(); shakeRed();
-        state.emit('position:sl_warning', pos);
+        // Stop tetiklendi mi?
+        if (unrealizedPnl <= pos.trailingStop && pos.trailingStop > 0) {
+          alertTrailingClose(); flashGreen(); _closePos(pos, price, 'trailing_stop'); return;
+        }
+      } else {
+        // Normal mod: TP/SL kontrolü
+        const hitTp = pos.side==='LONG' ? price>=pos.tp : price<=pos.tp;
+        const hitSl = pos.side==='LONG' ? price<=pos.sl : price>=pos.sl;
+
+        if (hitTp) { alertTrailingStart(); alertTpHit();
+          // Trailing moduna geç — ilk seviye 1, stop 0.70
+          state.setState({ positions: state.get('positions').map(x =>
+            x.id===pos.id ? {...x, isTrailing: true, trailingLevel: 1, trailingStop: 0.70} : x
+          ) });
+          return;
+        }
+        if (hitSl) { alertSlHit(); _closePos(pos, price, 'sl'); return; }
+
+        // SL %20 yakınlık uyarısı
+        const slTotal = Math.abs(pos.entry - pos.sl);
+        const dsl     = pos.distanceToSl ?? slTotal;
+        if (!_slWarnFired[pos.id] && slTotal>0 && dsl/slTotal < 0.2) {
+          _slWarnFired[pos.id] = true;
+          alertSlWarning(); shakeRed();
+          state.emit('position:sl_warning', pos);
+        }
       }
     });
   });
@@ -780,12 +812,25 @@ function _buildSinglePosCard(pos) {
   refs.price = _E('span');    refs.price.textContent = _fmtP(pos.entry);
   priceRow.appendChild(entryEl); priceRow.appendChild(refs.price);
 
-  // TP / SL
-  const tpslRow = _E('div', 'display:flex;gap:12px;font-family:"Space Mono",monospace;font-size:11px;padding:6px 8px;background:#0a1525;border-radius:6px;margin-bottom:4px');
-  const tpEl = _E('span', 'color:'+C.green); tpEl.textContent = 'TP ' + _fmtP(pos.tp);
-  const slEl = _E('span', 'color:'+C.red);   slEl.textContent = 'SL ' + _fmtP(pos.sl);
-  refs.timer = _E('span', 'color:'+C.muted+';margin-left:auto'); refs.timer.textContent = '00:00';
-  tpslRow.appendChild(tpEl); tpslRow.appendChild(slEl); tpslRow.appendChild(refs.timer);
+  // TP / SL atau Trailing
+  const tpslRow = _E('div', 'display:flex;gap:6px;font-family:"Space Mono",monospace;font-size:10px;padding:6px 8px;background:'+(pos.isTrailing?'#0d1e10':'#0a1525')+';border-radius:6px;margin-bottom:4px;border:1px solid '+(pos.isTrailing?C.green+'44':'transparent'));
+
+  if (pos.isTrailing) {
+    const trailEl = _E('span', 'color:'+C.green+';font-weight:700;white-space:nowrap'); trailEl.textContent = '📈 TRAIL';
+    const levelEl = _E('span', 'color:'+C.green+';white-space:nowrap'); levelEl.textContent = 'L:$' + (pos.trailingLevel||0);
+    const stopEl  = _E('span', 'color:'+C.yellow+';white-space:nowrap'); stopEl.textContent = 'S:$' + (pos.trailingStop??0.70).toFixed(2);
+    const curEl   = _E('span', 'color:'+C.muted+';white-space:nowrap');
+    const cur = pos.unrealizedPnl ?? 0;
+    curEl.textContent = 'C:$' + cur.toFixed(2);
+    tpslRow.appendChild(trailEl); tpslRow.appendChild(levelEl); tpslRow.appendChild(stopEl); tpslRow.appendChild(curEl);
+  } else {
+    const tpEl = _E('span', 'color:'+C.green); tpEl.textContent = 'TP ' + _fmtP(pos.tp);
+    const slEl = _E('span', 'color:'+C.red);   slEl.textContent = 'SL ' + _fmtP(pos.sl);
+    tpslRow.appendChild(tpEl); tpslRow.appendChild(slEl);
+  }
+
+  refs.timer = _E('span', 'color:'+C.muted+';margin-left:auto;white-space:nowrap'); refs.timer.textContent = '00:00';
+  tpslRow.appendChild(refs.timer);
 
   card.appendChild(refs.pnl);
   card.appendChild(priceRow);
@@ -1084,13 +1129,17 @@ function _buildEditOverlay(pos) {
   const infGrid = _E('div','display:grid;grid-template-columns:1fr 1fr;gap:10px');
 
   const infItems = [
-    ['Coin/Yön', pos.coin + ' ' + pos.side, (pos.side==='LONG'?C.green:C.red)],
+    ['Coin/Yön', pos.coin + ' ' + pos.side + (pos.isTrailing?' 📈':''), (pos.side==='LONG'?C.green:C.red)],
     ['Kaldıraç', '×' + pos.leverage, C.muted],
     ['Boyut', '$' + pos.size, C.yellow],
     ['Giriş', _fmtP(pos.entry), C.text],
     ['Anlık', _fmtP(pos.currentPrice ?? pos.entry), pos.unrealizedPnl>=0?C.green:C.red],
     ['PnL', (pos.unrealizedPnl>=0?'+':'')+'$'+pos.unrealizedPnl.toFixed(2), pos.unrealizedPnl>=0?C.green:C.red],
   ];
+  if (pos.isTrailing) {
+    infItems.push(['Seviye', '$' + (pos.trailingLevel||0), C.green]);
+    infItems.push(['Stop', '$' + (pos.trailingStop??0.70).toFixed(2), C.yellow]);
+  }
 
   infItems.forEach(([label, value, color]) => {
     const cell = _E('div');
@@ -1101,11 +1150,17 @@ function _buildEditOverlay(pos) {
   });
   infoSec.appendChild(infGrid); panel.appendChild(infoSec);
 
-  // TP/SL kontrol
-  let newTp = pos.tp, newSl = pos.sl;
-  const tpslSec = _E('div','margin-bottom:16px');
+  // TP/SL kontrol (Trailing modda disabled)
+  if (pos.isTrailing) {
+    const trailNote = _E('div','background:#0d1e10;border:1px solid '+C.green+'44;border-radius:10px;padding:12px;margin-bottom:16px;font-size:12px;color:'+C.green);
+    const cur = pos.unrealizedPnl ?? 0;
+    trailNote.innerHTML = '<strong>📈 Trailing Modda</strong><br/>Seviye: <strong>$'+(pos.trailingLevel||0)+'</strong> | Stop: <strong>$'+(pos.trailingStop??0.70).toFixed(2)+'</strong> | Güncel: <strong>$'+cur.toFixed(2)+'</strong><br/><br/><small>Her tam dolar geçilince seviye artır, stop = seviye × 0.70</small>';
+    panel.appendChild(trailNote);
+  } else {
+    let newTp = pos.tp, newSl = pos.sl;
+    const tpslSec = _E('div','margin-bottom:16px');
 
-  // TP slider
+    // TP slider
   const tpLbl = _E('div','font-size:11px;color:'+C.muted+';letter-spacing:1px;margin-bottom:8px');
   tpLbl.textContent = 'TAKE PROFIT';
   const tpRow = _E('div','display:flex;gap:8px;align-items:center');
@@ -1138,28 +1193,32 @@ function _buildEditOverlay(pos) {
   slSlider.step = (_r(Math.abs(pos.entry*0.001), 8)).toString();
   slSlider.value = newSl.toString();
   slSlider.style.cssText = 'flex:1;cursor:pointer;height:6px;background:'+C.border+';border-radius:3px;outline:none;-webkit-appearance:slider-horizontal;';
-  slSlider.addEventListener('input', e => {
-    newSl = parseFloat(e.target.value);
-    slVal.textContent = _fmtP(newSl);
-  });
-  slRow.appendChild(slVal); slRow.appendChild(slSlider); slSec = _E('div'); slSec.appendChild(slLbl); slSec.appendChild(slRow); var slSec;
-  tpslSec.appendChild(slSec);
+    slSlider.addEventListener('input', e => {
+      newSl = parseFloat(e.target.value);
+      slVal.textContent = _fmtP(newSl);
+    });
+    slRow.appendChild(slVal); slRow.appendChild(slSlider); slSec = _E('div'); slSec.appendChild(slLbl); slSec.appendChild(slRow); var slSec;
+    tpslSec.appendChild(slSec);
 
-  panel.appendChild(tpslSec);
+    panel.appendChild(tpslSec);
+  }
 
   // Butonlar
   const btnRow = _E('div','display:flex;gap:8px;margin-bottom:12px');
 
-  const updateBtn = _E('button','flex:1;padding:12px;border-radius:10px;border:none;font-family:"Space Mono",monospace;font-size:13px;font-weight:700;cursor:pointer;background:'+C.blue+';color:#000');
-  updateBtn.textContent = 'Güncelle';
-  updateBtn.addEventListener('click', () => {
-    const p = state.get('positions').find(x => x.id === pos.id);
-    if (!p) return;
-    // TP/SL güncelle, SL warning state'i sıfırla
-    _slWarnFired[pos.id] = false;
-    state.setState({ positions: state.get('positions').map(x => x.id===pos.id ? {...x, tp:newTp, sl:newSl} : x) });
-    closeEditModal();
-  });
+  if (!pos.isTrailing) {
+    const updateBtn = _E('button','flex:1;padding:12px;border-radius:10px;border:none;font-family:"Space Mono",monospace;font-size:13px;font-weight:700;cursor:pointer;background:'+C.blue+';color:#000');
+    updateBtn.textContent = 'Güncelle';
+    updateBtn.addEventListener('click', () => {
+      const p = state.get('positions').find(x => x.id === pos.id);
+      if (!p) return;
+      // TP/SL güncelle, SL warning state'i sıfırla
+      _slWarnFired[pos.id] = false;
+      state.setState({ positions: state.get('positions').map(x => x.id===pos.id ? {...x, tp:newTp, sl:newSl} : x) });
+      closeEditModal();
+    });
+    btnRow.appendChild(updateBtn);
+  }
 
   const closeBtn = _E('button','flex:1;padding:12px;border-radius:10px;border:1px solid '+C.border+';background:transparent;color:'+C.red+';font-weight:700;font-size:13px;cursor:pointer');
   closeBtn.textContent = 'Manuel Kapat';
@@ -1168,7 +1227,8 @@ function _buildEditOverlay(pos) {
     closeEditModal();
   });
 
-  btnRow.appendChild(updateBtn); btnRow.appendChild(closeBtn);
+  if (!pos.isTrailing && updateBtn) btnRow.appendChild(updateBtn);
+  btnRow.appendChild(closeBtn);
   panel.appendChild(btnRow);
 
   ov.appendChild(panel);
