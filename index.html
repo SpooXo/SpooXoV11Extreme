@@ -1,0 +1,1324 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#060a0f" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="SpooXo" />
+  <title>SpooXo V11</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; background: #060a0f; color: #e0e8f0; -webkit-tap-highlight-color: transparent; }
+    body { overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+    button { font-family: inherit; }
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: #060a0f; }
+    ::-webkit-scrollbar-thumb { background: #1a2535; border-radius: 2px; }
+    #app { max-width: 480px; margin: 0 auto; min-height: 100vh; }
+    @keyframes flashGreen { 0%,100%{background:transparent} 40%{background:rgba(0,255,136,0.15)} }
+    @keyframes shakeRed   { 0%,100%{transform:translateX(0)} 20%,60%{transform:translateX(-6px)} 40%,80%{transform:translateX(6px)} }
+    .flash-tp { animation: flashGreen 0.55s ease 3; }
+    .shake-sl { animation: shakeRed 0.35s ease 2; }
+  </style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+'use strict';
+
+/* ═══════════════════════════════════════════════
+   1. CORE / STATE
+   ═══════════════════════════════════════════════ */
+
+class EventEmitter {
+  constructor() { this._l = {}; }
+  on(ev, fn) {
+    if (!this._l[ev]) this._l[ev] = [];
+    this._l[ev].push(fn);
+    return () => { this._l[ev] = (this._l[ev] || []).filter(f => f !== fn); };
+  }
+  off(ev, fn) { this._l[ev] = (this._l[ev] || []).filter(f => f !== fn); }
+  emit(ev, data) {
+    (this._l[ev]  || []).slice().forEach(fn => fn(data));
+    (this._l['*'] || []).slice().forEach(fn => fn(ev, data));
+  }
+}
+
+class AppState extends EventEmitter {
+  constructor() {
+    super();
+    this._s = {
+      dailyPnl: 0, dailyTarget: 100, tradeCount: 0,
+      positions: [],       // aktif pozisyonlar, max 5
+      autoMode: false,
+      setups: [], prices: {},
+      connected: false, lastUpdate: null,
+    };
+  }
+
+  get(key) { return key ? this._s[key] : { ...this._s }; }
+
+  setState(patch) {
+    const prev = { ...this._s };
+    this._s = { ...this._s, ...patch };
+    Object.keys(patch).forEach(k => { if (prev[k] !== this._s[k]) this.emit('change:' + k, this._s[k]); });
+    this.emit('change', { prev, next: { ...this._s }, patch });
+  }
+
+  // Pozisyon ekle — max 5, başarılı ise pozisyon objesi döner, dolu ise null
+  addPosition(d) {
+    if (this._s.positions.length >= 5) return null;
+    const pos = {
+      ...d,
+      id: Date.now() + '_' + Math.random().toString(36).slice(2),
+      openTime: Date.now(),
+      unrealizedPnl: 0,
+      distanceToTp: null,
+      distanceToSl: null,
+    };
+    this.setState({ positions: [...this._s.positions, pos] });
+    return pos;
+  }
+
+  // Pozisyon kaldır
+  removePosition(id) {
+    this.setState({ positions: this._s.positions.filter(p => p.id !== id) });
+  }
+
+  // Fiyat güncelle — tüm eşleşen pozisyonları günceller
+  updatePrice(coin, price) {
+    this._s.prices = { ...this._s.prices, [coin]: price };
+    let changed = false;
+    this._s.positions = this._s.positions.map(pos => {
+      if (pos.coin !== coin) return pos;
+      changed = true;
+      const diff = pos.side === 'LONG' ? price - pos.entry : pos.entry - price;
+      const uPnl = parseFloat(((diff / pos.entry) * pos.size * pos.leverage).toFixed(2));
+      return {
+        ...pos, currentPrice: price, unrealizedPnl: uPnl,
+        distanceToTp: pos.side === 'LONG' ? pos.tp - price : price - pos.tp,
+        distanceToSl: pos.side === 'LONG' ? price - pos.sl : pos.sl - price,
+      };
+    });
+    this.emit('price', { coin, price });
+    if (changed) this.emit('change:positions', this._s.positions);
+    this._s.lastUpdate = Date.now();
+  }
+
+  resetDay() { this.setState({ dailyPnl: 0, tradeCount: 0, setups: [] }); this.emit('day:reset'); }
+}
+
+const state = new AppState();
+
+/* ═══════════════════════════════════════════════
+   2. CORE / STORAGE
+   ═══════════════════════════════════════════════ */
+
+const storage = {
+  get(k, fb = null) { try { const r = localStorage.getItem('spx_' + k); return r !== null ? JSON.parse(r) : fb; } catch(_) { return fb; } },
+  set(k, v) { try { localStorage.setItem('spx_' + k, JSON.stringify(v)); return true; } catch(_) { return false; } },
+  remove(k) { localStorage.removeItem('spx_' + k); },
+};
+
+/* ═══════════════════════════════════════════════
+   3. MODULES / CALCULATOR
+   ═══════════════════════════════════════════════ */
+
+const TAKER_FEE_RATE = 0.0005;
+
+function calculate({ entry, size, leverage, side }) {
+  if (!entry || entry <= 0) throw new Error('Geçersiz giriş fiyatı');
+  if (!size || size < 100 || size > 300) throw new Error('Pozisyon $100–$300 aralığında olmalı');
+  if (!leverage || leverage < 5 || leverage > 20) throw new Error('Kaldıraç 5x–20x aralığında olmalı');
+  if (side !== 'LONG' && side !== 'SHORT') throw new Error('Yön LONG veya SHORT olmalı');
+
+  const totalFee    = size * TAKER_FEE_RATE * 2;
+  const grossTarget = 1 + totalFee;
+  const moveRatio   = grossTarget / (size * leverage);
+
+  let tp, sl;
+  if (side === 'LONG') { tp = entry * (1 + moveRatio); sl = entry * (1 - moveRatio * 1.5); }
+  else                 { tp = entry * (1 - moveRatio); sl = entry * (1 + moveRatio * 1.5); }
+
+  const tpDist = Math.abs(tp - entry);
+  const slDist = Math.abs(sl - entry);
+  const prec   = entry >= 1000 ? 2 : entry >= 1 ? 4 : 6;
+
+  return {
+    tp: _r(tp, prec), sl: _r(sl, prec),
+    totalFee: _r(totalFee, 4), grossTarget: _r(grossTarget, 4),
+    moveRatio: _r(moveRatio, 6), tpDistance: _r(tpDist, prec),
+    slDistance: _r(slDist, prec), riskReward: _r(tpDist / slDist, 3),
+  };
+}
+
+function calcLivePnl(pos, currentPrice) {
+  const diff = pos.side === 'LONG' ? currentPrice - pos.entry : pos.entry - currentPrice;
+  return {
+    unrealizedPnl:    _r((diff / pos.entry) * pos.size * pos.leverage, 2),
+    unrealizedPnlPct: _r((diff / pos.entry) * pos.leverage * 100, 2),
+    distanceToTp:     pos.side === 'LONG' ? pos.tp - currentPrice : currentPrice - pos.tp,
+    distanceToSl:     pos.side === 'LONG' ? currentPrice - pos.sl : pos.sl - currentPrice,
+  };
+}
+
+function _r(v, d) { return parseFloat(v.toFixed(d)); }
+
+/* ═══════════════════════════════════════════════
+   4. MODULES / COUNTER
+   ═══════════════════════════════════════════════ */
+
+const DAILY_TARGET = 100;
+
+function initCounter() {
+  const saved = storage.get('daily');
+  if (saved && saved.date === _today()) {
+    state.setState({ dailyPnl: saved.dailyPnl ?? 0, tradeCount: saved.tradeCount ?? 0 });
+  } else {
+    _persistCounter();
+  }
+}
+
+function recordTrade(pnl) {
+  const newPnl = parseFloat((state.get('dailyPnl') + pnl).toFixed(2));
+  const newCnt = state.get('tradeCount') + 1;
+  state.setState({ dailyPnl: newPnl, tradeCount: newCnt });
+  _persistCounter();
+  if (newPnl >= DAILY_TARGET) state.emit('counter:target_reached', { dailyPnl: newPnl, tradeCount: newCnt });
+}
+
+function getProgress()     { return Math.min(state.get('dailyPnl') / DAILY_TARGET, 1); }
+function getRemaining()    { return Math.max(DAILY_TARGET - state.get('dailyPnl'), 0); }
+function isTargetReached() { return state.get('dailyPnl') >= DAILY_TARGET; }
+
+function _today()          { return new Date().toISOString().slice(0, 10); }
+function _persistCounter() { storage.set('daily', { date: _today(), dailyPnl: state.get('dailyPnl'), tradeCount: state.get('tradeCount') }); }
+
+/* ═══════════════════════════════════════════════
+   5. MODULES / HISTORY
+   ═══════════════════════════════════════════════ */
+
+function addToHistory(trade) {
+  const h = storage.get('history') || {};
+  const today = _today();
+  if (!h[today]) h[today] = [];
+  h[today].unshift({
+    coin:       trade.coin,
+    side:       trade.side,
+    entry:      trade.entry,
+    exitPrice:  trade.exitPrice,
+    pnl:        trade.pnl,
+    duration:   trade.duration,
+    gateScore:  trade.gateScore ?? null,
+    reason:     trade.reason,    // 'tp' | 'sl' | 'manual'
+    isAuto:     trade.isAuto ?? false,
+    closedAt:   Date.now(),
+  });
+  // Günde max 500 kayıt
+  if (h[today].length > 500) h[today] = h[today].slice(0, 500);
+  storage.set('history', h);
+  state.emit('history:updated', h[today]);
+}
+
+function getTodayHistory() {
+  const h = storage.get('history') || {};
+  return h[_today()] || [];
+}
+
+function getDailyReport() {
+  const trades = getTodayHistory();
+  if (!trades.length) return null;
+  const winners  = trades.filter(t => t.pnl > 0);
+  const losers   = trades.filter(t => t.pnl <= 0);
+  const netPnl   = _r(trades.reduce((s, t) => s + t.pnl, 0), 2);
+  const avgDur   = Math.round(trades.reduce((s, t) => s + (t.duration || 0), 0) / trades.length / 1000);
+  const best     = trades.reduce((b, t) => t.pnl > b.pnl ? t : b, trades[0]);
+  const worst    = trades.reduce((w, t) => t.pnl < w.pnl ? t : w, trades[0]);
+  return { total: trades.length, winners: winners.length, losers: losers.length,
+           winRate: _r(winners.length / trades.length * 100, 1), netPnl, avgDur, best, worst };
+}
+
+/* ═══════════════════════════════════════════════
+   6. UI / ALERTS
+   ═══════════════════════════════════════════════ */
+
+let _audioCtx = null;
+
+function _getCtx() {
+  if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (_audioCtx.state === 'suspended') _audioCtx.resume();
+  return _audioCtx;
+}
+
+function _beep({ freq = 880, duration = 120, volume = 0.4, type = 'sine' } = {}) {
+  try {
+    const ctx = _getCtx(), osc = ctx.createOscillator(), gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, ctx.currentTime);
+    gain.gain.setValueAtTime(volume, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration / 1000);
+    osc.start(ctx.currentTime); osc.stop(ctx.currentTime + duration / 1000);
+  } catch(e) { console.warn('[alerts]', e.message); }
+}
+
+function _vib(p) { if (navigator.vibrate) navigator.vibrate(p); }
+
+function alertEntry()         { _beep({freq:1047,duration:100,volume:0.5}); setTimeout(()=>_beep({freq:1319,duration:150,volume:0.6}),130); _vib([100,50,200]); }
+function alertReady()         { _beep({freq:659,duration:120,volume:0.35}); _vib(80); }
+function alertTpHit()         { _beep({freq:880,duration:80,volume:0.5}); setTimeout(()=>_beep({freq:1047,duration:80,volume:0.55}),100); setTimeout(()=>_beep({freq:1319,duration:120,volume:0.6}),200); _vib([80,40,80,40,200]); }
+function alertSlHit()         { _beep({freq:440,duration:150,volume:0.5,type:'square'}); setTimeout(()=>_beep({freq:330,duration:200,volume:0.45,type:'square'}),170); _vib([200,100,200]); }
+function alertSlWarning()     { _beep({freq:550,duration:100,volume:0.5,type:'square'}); setTimeout(()=>_beep({freq:440,duration:120,volume:0.5,type:'square'}),140); _vib([150,80,150]); }
+function alertTargetReached() { [523,659,784,1047].forEach((f,i)=>setTimeout(()=>_beep({freq:f,duration:150,volume:0.6}),i*160)); _vib([100,50,100,50,100,50,400]); }
+function alertDisconnected()  { _beep({freq:220,duration:300,volume:0.3,type:'sawtooth'}); _vib(50); }
+
+function flashGreen() {
+  const a = document.getElementById('app');
+  a.classList.remove('flash-tp'); void a.offsetWidth;
+  a.classList.add('flash-tp');
+  setTimeout(() => a.classList.remove('flash-tp'), 1700);
+}
+function shakeRed() {
+  const a = document.getElementById('app');
+  a.classList.remove('shake-sl'); void a.offsetWidth;
+  a.classList.add('shake-sl');
+  setTimeout(() => a.classList.remove('shake-sl'), 750);
+}
+
+function initAudio() {
+  const r = () => _getCtx();
+  document.addEventListener('touchstart', r, { once: true });
+  document.addEventListener('click',      r, { once: true });
+}
+
+/* ═══════════════════════════════════════════════
+   7. CORE / BINANCE
+   ═══════════════════════════════════════════════ */
+
+const REST_BASE = 'https://fapi.binance.com';
+const WS_BASE   = 'wss://fstream.binance.com';
+
+const COINS = [
+  'BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT',
+  'DOGEUSDT','ADAUSDT','AVAXUSDT','LTCUSDT','LINKUSDT',
+  'DOTUSDT','MATICUSDT','UNIUSDT','ATOMUSDT','NEARUSDT',
+  'APTUSDT','ARBUSDT','OPUSDT','INJUSDT','SUIUSDT',
+  'SEIUSDT','TIAUSDT','WLDUSDT','FETUSDT','AGIXUSDT',
+  'RNDRUSDT','TRBUSDT','ORDIUSDT','SATSUSDT','1000PEPEUSDT',
+];
+
+async function _restGet(path, params = {}) {
+  const url = new URL(REST_BASE + path);
+  Object.entries(params).forEach(([k,v]) => url.searchParams.set(k, v));
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error('Binance REST ' + path + ' → ' + res.status);
+  return res.json();
+}
+
+async function getFunding(symbol)      { const d = await _restGet('/fapi/v1/premiumIndex', { symbol }); return parseFloat(d.lastFundingRate); }
+async function getOpenInterest(symbol) { const d = await _restGet('/fapi/v1/openInterest', { symbol }); return parseFloat(d.openInterest); }
+
+async function getKlines(symbol, interval = '1m', limit = 25) {
+  const raw = await _restGet('/fapi/v1/klines', { symbol, interval, limit });
+  return raw.map(k => ({
+    openTime: k[0], open:+k[1], high:+k[2], low:+k[3], close:+k[4],
+    volume:+k[5], closeTime:k[6], takerBuyVolume:+k[9], takerSellVolume:+k[5]-+k[9],
+  }));
+}
+
+let _ws = null, _reconnTimer = null, _reconnDelay = 2000;
+
+function connectWs() {
+  if (_ws && _ws.readyState === WebSocket.OPEN) return;
+  _clearReconn();
+  const streams = COINS.map(c => c.toLowerCase() + '@miniTicker').join('/');
+  _ws = new WebSocket(WS_BASE + '/stream?streams=' + streams);
+  _ws.onopen    = () => { _reconnDelay = 2000; state.setState({ connected: true }); };
+  _ws.onmessage = ({ data }) => {
+    try { const m = JSON.parse(data), t = m.data ?? m;
+      if (t.e === '24hrMiniTicker') state.updatePrice(t.s, parseFloat(t.c)); } catch(_) {} };
+  _ws.onerror   = () => {};
+  _ws.onclose   = () => { state.setState({ connected: false }); alertDisconnected(); _scheduleReconn(); };
+}
+
+function disconnectWs() { _clearReconn(); if (_ws) { _ws.onclose = null; _ws.close(); _ws = null; } state.setState({ connected: false }); }
+function _scheduleReconn() { _reconnTimer = setTimeout(() => { connectWs(); _reconnDelay = Math.min(_reconnDelay*2, 30000); }, _reconnDelay); }
+function _clearReconn()    { if (_reconnTimer) { clearTimeout(_reconnTimer); _reconnTimer = null; } }
+
+/* ═══════════════════════════════════════════════
+   8. MODULES / SCANNER
+   ═══════════════════════════════════════════════ */
+
+const RSI_PERIOD = 14, VOLUME_MA_LEN = 20, TAKER_LOOKBACK = 3;
+const TAKER_THRESHOLD = 1.3, VOLUME_MULT = 1.5, FUNDING_LIMIT = 0.0005;
+const _oiCache = {};
+let _scanning = false, _scanTimer = null;
+
+async function evaluateCoin(symbol, side) {
+  const klines = await getKlines(symbol, '1m', 25);
+  const [funding, oi] = await Promise.all([getFunding(symbol), getOpenInterest(symbol)]);
+  const closes = klines.map(k => k.close);
+  const current = closes.at(-1), prev = closes.at(-2);
+
+  const g1 = Math.abs(funding) < FUNDING_LIMIT;
+
+  const oiPrev = _oiCache[symbol]?.value ?? oi;
+  _oiCache[symbol] = { value: oi, time: Date.now() };
+  const oiRising = oi > oiPrev, priceUp = current > prev;
+  const g2 = side === 'LONG' ? oiRising && priceUp : oiRising && !priceUp;
+
+  const last3 = klines.slice(-TAKER_LOOKBACK);
+  const buyVol = last3.reduce((s,k) => s+k.takerBuyVolume, 0);
+  const sellVol = last3.reduce((s,k) => s+k.takerSellVolume, 0);
+  const takerRatio = sellVol > 0 ? buyVol / sellVol : 0;
+  const g3 = side === 'LONG' ? takerRatio > TAKER_THRESHOLD : (1/Math.max(takerRatio,0.001)) > TAKER_THRESHOLD;
+
+  const rsi = _calcRsi(closes, RSI_PERIOD);
+  const momentum = closes.at(-1) > closes.at(-4);
+  const g4 = side === 'LONG' ? (rsi>=45&&rsi<=70&&momentum) : (rsi>=30&&rsi<=55&&!momentum);
+
+  const volumes = klines.map(k => k.volume);
+  const lastVol = volumes.at(-1), maVol = _avg(volumes.slice(-VOLUME_MA_LEN-1,-1));
+  const g5 = lastVol > maVol * VOLUME_MULT;
+
+  const gateScore = [g1,g2,g3,g4,g5].filter(Boolean).length;
+  const signal    = gateScore===5?'GİR':gateScore===4?'HAZIRLAN':'GIRME';
+
+  const gateReasons = {
+    g1: g1?'':funding>0?'Funding yüksek (+'+_r(funding*100,3)+'%)':'Funding düşük ('+_r(funding*100,3)+'%)',
+    g2: g2?'':!oiRising?'OI düşüyor':side==='LONG'?'Fiyat aşağı':'Fiyat yukarı',
+    g3: g3?'':(side==='LONG'?'Satış baskısı ('+_r(takerRatio,2)+'x)':'Alış baskısı ('+_r(takerRatio,2)+'x)'),
+    g4: g4?'':(side==='LONG'?(rsi<45?'RSI düşük ('+_r(rsi,1)+')':rsi>70?'RSI yüksek ('+_r(rsi,1)+')':'Momentum yok'):(rsi<30?'RSI düşük ('+_r(rsi,1)+')':rsi>55?'RSI yüksek ('+_r(rsi,1)+')':'Momentum yok')),
+    g5: g5?'':'Volume zayıf ('+_r(lastVol/Math.max(maVol,0.0001),2)+'x)',
+  };
+
+  return { coin:symbol, side, signal, gateScore, gates:{g1,g2,g3,g4,g5}, gateReasons,
+           funding:_r(funding*100,4), oi:_r(oi,2), takerRatio:_r(takerRatio,3),
+           rsi:_r(rsi,1), volume:_r(lastVol,2), volumeMa:_r(maVol,2), price:current, ts:Date.now() };
+}
+
+async function scanAll() {
+  if (_scanning) return;
+  _scanning = true;
+  const results = [];
+  for (let i = 0; i < COINS.length; i += 5) {
+    const batch = COINS.slice(i, i+5);
+    const settled = await Promise.allSettled(batch.flatMap(c => [evaluateCoin(c,'LONG'), evaluateCoin(c,'SHORT')]));
+    settled.forEach(r => { if (r.status==='fulfilled') results.push(r.value); });
+  }
+  const best = {};
+  results.forEach(r => { if (!best[r.coin] || r.gateScore > best[r.coin].gateScore) best[r.coin] = r; });
+  const setups = Object.values(best).sort((a,b) => b.gateScore - a.gateScore);
+  state.setState({ setups });
+  _scanning = false;
+  state.emit('scanner:done', { count: setups.length, ts: Date.now() });
+  // Otomatik mod hook
+  if (state.get('autoMode')) _autoTrade(setups);
+  return setups;
+}
+
+function _autoTrade(setups) {
+  const positions = state.get('positions');
+  if (positions.length >= 5) return;
+  const openCoins = new Set(positions.map(p => p.coin));
+  const settings  = storage.get('settings') || { size: 100, leverage: 10 };
+  let opened = 0, available = 5 - positions.length;
+
+  for (const setup of setups) {
+    if (opened >= available || setup.gateScore < 5) break;
+    if (openCoins.has(setup.coin)) continue;
+    const price = state.get('prices')[setup.coin] ?? setup.price;
+    if (!price) continue;
+    try {
+      const calc = calculate({ entry: price, size: settings.size, leverage: settings.leverage, side: setup.side });
+      const pos  = state.addPosition({ coin:setup.coin, side:setup.side, entry:price,
+        size:settings.size, leverage:settings.leverage, tp:calc.tp, sl:calc.sl,
+        isAuto:true, gateScore:setup.gateScore });
+      if (pos) { openCoins.add(setup.coin); opened++; alertEntry(); }
+    } catch(_) {}
+  }
+}
+
+function startScanner(ms = 60000) { stopScanner(); scanAll(); _scanTimer = setInterval(scanAll, ms); }
+function stopScanner()            { if (_scanTimer) { clearInterval(_scanTimer); _scanTimer = null; } }
+
+function _calcRsi(closes, period) {
+  if (closes.length < period+1) return 50;
+  let gains=0, losses=0;
+  for (let i=1; i<=period; i++) { const d=closes[i]-closes[i-1]; d>0?gains+=d:losses-=d; }
+  let ag=gains/period, al=losses/period;
+  for (let i=period+1; i<closes.length; i++) {
+    const d=closes[i]-closes[i-1];
+    ag=(ag*(period-1)+Math.max(d,0))/period; al=(al*(period-1)+Math.max(-d,0))/period;
+  }
+  if (al===0) return 100;
+  return 100-100/(1+ag/al);
+}
+function _avg(arr) { return arr.length ? arr.reduce((s,v)=>s+v,0)/arr.length : 0; }
+
+/* ═══════════════════════════════════════════════
+   9. MODULES / TRACKER (çoklu pozisyon)
+   ═══════════════════════════════════════════════ */
+
+let _trackUnsub    = null;
+let _durTimers     = {};   // id → timer
+let _slWarnFired   = {};   // id → bool
+
+function startTracking() {
+  // Zaten dinliyorsa tekrar kurma
+  if (_trackUnsub) return;
+  _trackUnsub = state.on('price', ({ coin, price }) => {
+    const positions = state.get('positions');
+    const matching  = positions.filter(p => p.coin === coin);
+    if (!matching.length) return;
+
+    matching.forEach(pos => {
+      // TP/SL kontrolü
+      const hitTp = pos.side==='LONG' ? price>=pos.tp : price<=pos.tp;
+      const hitSl = pos.side==='LONG' ? price<=pos.sl : price>=pos.sl;
+
+      if (hitTp) { alertTpHit(); flashGreen(); _closePos(pos, price, 'tp'); return; }
+      if (hitSl) { alertSlHit(); _closePos(pos, price, 'sl'); return; }
+
+      // SL %20 yakınlık uyarısı
+      const slTotal = Math.abs(pos.entry - pos.sl);
+      const dsl     = pos.distanceToSl ?? slTotal;
+      if (!_slWarnFired[pos.id] && slTotal>0 && dsl/slTotal < 0.2) {
+        _slWarnFired[pos.id] = true;
+        alertSlWarning(); shakeRed();
+        state.emit('position:sl_warning', pos);
+      }
+    });
+  });
+}
+
+function stopTracking() {
+  if (_trackUnsub) { _trackUnsub(); _trackUnsub = null; }
+  Object.values(_durTimers).forEach(t => clearTimeout(t));
+  _durTimers = {};
+  _slWarnFired = {};
+}
+
+// Pozisyon aç — tracker yoksa başlat, süre timer'ı kur
+function openAndTrack(posData) {
+  const pos = state.addPosition(posData);
+  if (!pos) return null;
+  startTracking();
+  _slWarnFired[pos.id] = false;
+  _durTimers[pos.id] = setTimeout(() => {
+    const positions = state.get('positions');
+    if (positions.find(p => p.id === pos.id)) state.emit('position:overtime', pos);
+  }, 10 * 60 * 1000);
+  return pos;
+}
+
+function closeManually(posId) {
+  const pos = state.get('positions').find(p => p.id === posId);
+  if (!pos) return;
+  _closePos(pos, pos.currentPrice ?? pos.entry, 'manual');
+}
+
+function _closePos(pos, exitPrice, reason) {
+  // Timer temizle
+  if (_durTimers[pos.id]) { clearTimeout(_durTimers[pos.id]); delete _durTimers[pos.id]; }
+  delete _slWarnFired[pos.id];
+
+  const pnl = calcLivePnl(pos, exitPrice).unrealizedPnl;
+  recordTrade(pnl);
+  addToHistory({ ...pos, exitPrice, pnl, reason, duration: Date.now() - pos.openTime });
+  state.removePosition(pos.id);
+  state.emit('position:closed', { ...pos, exitPrice, pnl, reason });
+
+  // Tüm pozisyonlar kapandıysa tracker'ı durdur
+  if (state.get('positions').length === 0) stopTracking();
+}
+
+/* ═══════════════════════════════════════════════
+   10. UI / DASHBOARD
+   ═══════════════════════════════════════════════ */
+
+const C = {
+  bg:'#060a0f', panel:'#0d1520', border:'#1a2535',
+  green:'#00ff88', red:'#ff4466', yellow:'#ffd000',
+  blue:'#40c4ff', purple:'#c87fff', text:'#e0e8f0', muted:'#4a6080',
+};
+
+let _pbFill=null, _pbLeft=null, _pbRight=null;
+let _connDot=null, _connTxt=null;
+let _autoBtn=null;
+let _posListEl=null, _posEmptyEl=null;
+let _posCardMap = new Map();  // id → { card, refs }
+let _posTimerInterval = null;
+let _histListEl=null;
+let _dashUnsubs=[];
+
+function mountDashboard(root) {
+  root.style.cssText = 'background:'+C.bg+';min-height:100vh;color:'+C.text+';font-family:"DM Sans",sans-serif;padding:0 0 80px;';
+  root.appendChild(_buildHeader());
+  root.appendChild(_buildPositionsSection());
+  root.appendChild(_buildSetupSection());
+  root.appendChild(_buildHistorySection());
+
+  _dashUnsubs.push(state.on('change:connected',  v  => _onConnChange(v)));
+  _dashUnsubs.push(state.on('change:dailyPnl',   () => _onCounterChange()));
+  _dashUnsubs.push(state.on('change:tradeCount', () => _onCounterChange()));
+  _dashUnsubs.push(state.on('change:positions',  ps => _renderPositions(ps)));
+  _dashUnsubs.push(state.on('change:autoMode',   v  => _onAutoChange(v)));
+  _dashUnsubs.push(state.on('change:setups',     () => _renderSetups()));
+  _dashUnsubs.push(state.on('scanner:done',      () => _renderSetups()));
+  _dashUnsubs.push(state.on('history:updated',   () => _renderHistory()));
+}
+
+function _E(tag, css) { const n=document.createElement(tag); if(css) n.style.cssText=css; return n; }
+
+/* Header */
+function _buildHeader() {
+  const h = _E('div', 'padding:16px;position:sticky;top:0;z-index:10;background:'+C.bg+';border-bottom:1px solid '+C.border);
+
+  // Üst satır
+  const top = _E('div', 'display:flex;justify-content:space-between;align-items:center;margin-bottom:12px');
+  const logo = _E('div', 'font-family:"Space Mono",monospace;font-size:14px;color:'+C.purple+';letter-spacing:1px');
+  logo.textContent = 'SpooXo V11';
+
+  const right = _E('div', 'display:flex;align-items:center;gap:10px');
+
+  // Rapor butonu
+  const repBtn = _E('button', 'padding:5px 10px;border-radius:6px;border:1px solid '+C.border+';background:transparent;color:'+C.muted+';font-size:11px;cursor:pointer');
+  repBtn.textContent = 'Rapor';
+  repBtn.addEventListener('click', openReportModal);
+
+  // Auto toggle
+  _autoBtn = _E('button', 'padding:5px 12px;border-radius:6px;font-family:"Space Mono",monospace;font-size:11px;font-weight:700;cursor:pointer;transition:all 0.2s;border:1px solid '+C.border+';background:transparent;color:'+C.muted);
+  _autoBtn.textContent = 'ATO: OFF';
+  _autoBtn.addEventListener('click', () => {
+    const cur = state.get('autoMode');
+    state.setState({ autoMode: !cur });
+  });
+
+  // Bağlantı
+  _connDot = _E('div', 'width:8px;height:8px;border-radius:50%;background:'+C.red);
+  _connTxt = _E('span', 'font-size:11px;color:'+C.muted);
+  _connTxt.textContent = 'BAĞLANIYOR';
+  const cw = _E('div', 'display:flex;align-items:center;gap:5px');
+  cw.appendChild(_connDot); cw.appendChild(_connTxt);
+
+  right.appendChild(repBtn); right.appendChild(_autoBtn); right.appendChild(cw);
+  top.appendChild(logo); top.appendChild(right);
+
+  // Progress bar
+  const pbRow = _E('div', 'display:flex;justify-content:space-between;margin-bottom:6px');
+  _pbLeft  = _E('span', 'font-family:"Space Mono",monospace;font-size:12px;color:'+C.green);
+  _pbRight = _E('span', 'font-size:11px;color:'+C.muted);
+  pbRow.appendChild(_pbLeft); pbRow.appendChild(_pbRight);
+
+  const pbWrap = _E('div', 'background:'+C.border+';border-radius:4px;height:6px;overflow:hidden');
+  _pbFill = _E('div', 'height:100%;border-radius:4px;background:linear-gradient(90deg,'+C.green+','+C.blue+');transition:width 0.4s ease;width:0%');
+  pbWrap.appendChild(_pbFill);
+
+  _onCounterChange();
+  h.appendChild(top); h.appendChild(pbRow); h.appendChild(pbWrap);
+  return h;
+}
+
+function _onConnChange(val) {
+  _connDot.style.background = val ? C.green : C.red;
+  _connTxt.textContent      = val ? 'CANLI' : 'BAĞLANIYOR';
+}
+function _onCounterChange() {
+  const pnl=state.get('dailyPnl'), cnt=state.get('tradeCount');
+  _pbLeft.textContent  = '$'+pnl.toFixed(2)+' / $100';
+  _pbRight.textContent = cnt+' işlem · $'+getRemaining().toFixed(2)+' kaldı';
+  _pbFill.style.width  = (getProgress()*100)+'%';
+  if (isTargetReached()) _pbFill.style.background = C.green;
+}
+function _onAutoChange(val) {
+  _autoBtn.textContent   = 'ATO: '+(val?'ON':'OFF');
+  _autoBtn.style.color   = val ? C.yellow : C.muted;
+  _autoBtn.style.borderColor = val ? C.yellow : C.border;
+  _autoBtn.style.background  = val ? C.yellow+'22' : 'transparent';
+}
+
+/* Pozisyon listesi */
+function _buildPositionsSection() {
+  const sec = _E('div', 'padding:12px 12px 0');
+  const hdr = _E('div', 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px');
+  const ttl = _E('div', 'font-size:11px;color:'+C.muted+';letter-spacing:1px');
+  ttl.textContent = 'AKTİF POZİSYONLAR';
+  const cnt = _E('span', 'font-family:"Space Mono",monospace;font-size:11px;color:'+C.muted);
+  cnt.textContent = '0 / 5';
+  hdr.appendChild(ttl); hdr.appendChild(cnt);
+  sec.appendChild(hdr);
+
+  _posEmptyEl = _E('div', 'text-align:center;color:'+C.muted+';font-size:12px;padding:12px 0 4px');
+  _posEmptyEl.textContent = 'Açık pozisyon yok';
+
+  _posListEl = _E('div', 'display:flex;flex-direction:column;gap:8px;display:none');
+  sec.appendChild(_posEmptyEl); sec.appendChild(_posListEl);
+
+  // Sayacı güncellemek için
+  _dashUnsubs.push(state.on('change:positions', ps => {
+    cnt.textContent = ps.length + ' / 5';
+    cnt.style.color = ps.length >= 5 ? C.red : C.muted;
+  }));
+
+  // Global timer — tüm açık pozisyonların süresini güncelle
+  _posTimerInterval = setInterval(() => {
+    for (const [id, { refs }] of _posCardMap) {
+      const pos = state.get('positions').find(p => p.id === id);
+      if (!pos) continue;
+      const sec = Math.floor((Date.now() - pos.openTime) / 1000);
+      const mm = String(Math.floor(sec/60)).padStart(2,'0');
+      const ss = String(sec%60).padStart(2,'0');
+      refs.timer.textContent = mm + ':' + ss;
+      refs.timer.style.color = sec > 600 ? C.yellow : C.muted;
+    }
+  }, 1000);
+  _dashUnsubs.push(() => { if (_posTimerInterval) clearInterval(_posTimerInterval); });
+
+  return sec;
+}
+
+function _renderPositions(positions) {
+  // Kaldırılmış pozisyon kartlarını sil
+  for (const [id, { card }] of _posCardMap) {
+    if (!positions.find(p => p.id === id)) {
+      card.remove();
+      _posCardMap.delete(id);
+    }
+  }
+
+  // Yeni pozisyon kartları ekle
+  positions.forEach(pos => {
+    if (!_posCardMap.has(pos.id)) {
+      const { card, refs } = _buildSinglePosCard(pos);
+      _posListEl.appendChild(card);
+      _posCardMap.set(pos.id, { card, refs });
+    }
+  });
+
+  // Mevcut kartların PnL ve fiyatını güncelle
+  positions.forEach(pos => {
+    const entry = _posCardMap.get(pos.id);
+    if (!entry) return;
+    const { refs } = entry;
+    const pnl = pos.unrealizedPnl ?? 0;
+    refs.pnl.textContent   = (pnl>=0?'+':'')+'$'+pnl.toFixed(2);
+    refs.pnl.style.color   = pnl>=0 ? C.green : C.red;
+    refs.price.textContent = _fmtP(pos.currentPrice ?? pos.entry);
+    refs.price.style.color = pnl>=0 ? C.green : C.red;
+  });
+
+  // Boş durum göster/gizle
+  if (positions.length === 0) {
+    _posEmptyEl.style.display = 'block';
+    _posListEl.style.display  = 'none';
+  } else {
+    _posEmptyEl.style.display = 'none';
+    _posListEl.style.display  = 'flex';
+    _posListEl.style.flexDirection = 'column';
+  }
+}
+
+function _buildSinglePosCard(pos) {
+  const sideColor = pos.side==='LONG' ? C.green : C.red;
+  const card = _E('div', 'background:'+C.panel+';border-radius:10px;border:1px solid '+(pos.isAuto?C.purple+'44':C.border)+';padding:12px');
+
+  // Üst satır: coin + side + auto badge + edit + close button
+  const top = _E('div', 'display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:4px');
+  const coinEl = _E('div', 'font-family:"Space Mono",monospace;font-size:13px;font-weight:700;color:'+sideColor+';flex:1');
+  coinEl.textContent = pos.coin + ' ' + pos.side + ' ×' + pos.leverage;
+  if (pos.isAuto) {
+    const ab = _E('span', 'font-size:9px;color:'+C.purple+';background:'+C.purple+'22;padding:2px 5px;border-radius:4px;margin-left:6px');
+    ab.textContent = 'ATO'; coinEl.appendChild(ab);
+  }
+
+  const editBtn = _E('button', 'background:none;border:1px solid '+C.border+';border-radius:6px;color:'+C.blue+';font-size:11px;padding:3px 8px;cursor:pointer');
+  editBtn.textContent = '✎ Edit';
+  editBtn.addEventListener('click', () => openEditPositionModal(pos));
+
+  const closeBtn = _E('button', 'background:none;border:1px solid '+C.border+';border-radius:6px;color:'+C.muted+';font-size:11px;padding:3px 8px;cursor:pointer');
+  closeBtn.textContent = '✕ Kapat';
+
+  top.appendChild(coinEl); top.appendChild(editBtn); top.appendChild(closeBtn); card.appendChild(top);
+
+  // Confirm row (gizli)
+  const confirm = _E('div', 'display:none;padding:8px;background:#0a1525;border-radius:8px;margin-top:8px');
+  const confPnl = _E('div', 'font-family:"Space Mono",monospace;font-size:12px;text-align:center;margin-bottom:8px');
+  const confRow = _E('div', 'display:flex;gap:6px');
+  const okBtn = _E('button', 'flex:1;padding:8px;border-radius:6px;border:none;background:'+C.red+'33;color:'+C.red+';font-weight:700;font-size:12px;cursor:pointer');
+  okBtn.textContent = 'Onayla';
+  const cancelBtn = _E('button', 'flex:1;padding:8px;border-radius:6px;border:1px solid '+C.border+';background:transparent;color:'+C.muted+';font-size:12px;cursor:pointer');
+  cancelBtn.textContent = 'Vazgeç';
+  confRow.appendChild(okBtn); confRow.appendChild(cancelBtn);
+  confirm.appendChild(confPnl); confirm.appendChild(confRow);
+
+  closeBtn.addEventListener('click', () => {
+    const p = state.get('positions').find(x => x.id === pos.id);
+    if (!p) return;
+    const pnl = calcLivePnl(p, p.currentPrice ?? p.entry).unrealizedPnl;
+    confPnl.textContent = 'PnL: '+(pnl>=0?'+':'')+'$'+pnl.toFixed(2);
+    confPnl.style.color = pnl>=0 ? C.green : C.red;
+    confirm.style.display = confirm.style.display==='none' ? 'block' : 'none';
+  });
+  okBtn.addEventListener('click',     () => { closeManually(pos.id); });
+  cancelBtn.addEventListener('click', () => { confirm.style.display='none'; });
+
+  // PnL büyük
+  const refs = {};
+  refs.pnl = _E('div', 'font-family:"Space Mono",monospace;font-size:24px;font-weight:700;margin:4px 0');
+  refs.pnl.textContent = '$0.00';
+
+  // Fiyat satırı
+  const priceRow = _E('div', 'display:flex;justify-content:space-between;font-size:11px;color:'+C.muted+';margin-bottom:6px;font-family:"Space Mono",monospace');
+  const entryEl = _E('span'); entryEl.textContent = 'Giriş ' + _fmtP(pos.entry);
+  refs.price = _E('span');    refs.price.textContent = _fmtP(pos.entry);
+  priceRow.appendChild(entryEl); priceRow.appendChild(refs.price);
+
+  // TP / SL
+  const tpslRow = _E('div', 'display:flex;gap:12px;font-family:"Space Mono",monospace;font-size:11px;padding:6px 8px;background:#0a1525;border-radius:6px;margin-bottom:4px');
+  const tpEl = _E('span', 'color:'+C.green); tpEl.textContent = 'TP ' + _fmtP(pos.tp);
+  const slEl = _E('span', 'color:'+C.red);   slEl.textContent = 'SL ' + _fmtP(pos.sl);
+  refs.timer = _E('span', 'color:'+C.muted+';margin-left:auto'); refs.timer.textContent = '00:00';
+  tpslRow.appendChild(tpEl); tpslRow.appendChild(slEl); tpslRow.appendChild(refs.timer);
+
+  card.appendChild(refs.pnl);
+  card.appendChild(priceRow);
+  card.appendChild(tpslRow);
+  card.appendChild(confirm);
+  return { card, refs };
+}
+
+/* Setup listesi */
+function _buildSetupSection() {
+  const sec = _E('div', 'padding:12px');
+  const ttl = _E('div', 'font-size:11px;color:'+C.muted+';letter-spacing:1px;margin-bottom:10px');
+  ttl.textContent = 'SETUP LİSTESİ';
+  const list = _E('div', 'display:flex;flex-direction:column;gap:8px');
+  // Selector reference
+  sec._list = list;
+  sec.appendChild(ttl); sec.appendChild(list);
+  _dashUnsubs.push(() => { /* list ref GC'd with sec */ });
+  // Store globally
+  window._setupListEl = list;
+  _renderSetups();
+  return sec;
+}
+
+function _renderSetups() {
+  const list = window._setupListEl;
+  if (!list) return;
+  while (list.firstChild) list.removeChild(list.firstChild);
+  const setups = state.get('setups');
+  if (!setups.length) {
+    const e = _E('div', 'text-align:center;color:'+C.muted+';font-size:13px;padding:24px');
+    e.textContent = 'Tarama bekleniyor…'; list.appendChild(e); return;
+  }
+  setups.forEach(s => list.appendChild(_buildSetupCard(s)));
+}
+
+function _buildSetupCard(s) {
+  const sc = s.signal==='GİR'?C.green:s.signal==='HAZIRLAN'?C.yellow:C.muted;
+  const borderC = s.signal==='GİR'?C.green+'44':s.signal==='HAZIRLAN'?C.yellow+'33':C.border;
+  const card = _E('div', 'background:'+C.panel+';border-radius:10px;border:1px solid '+borderC+';padding:12px;cursor:pointer;transition:opacity 0.15s');
+  card.addEventListener('click', () => openModal(s));
+  card.addEventListener('touchstart', ()=>{card.style.opacity='0.7';},{passive:true});
+  card.addEventListener('touchend',   ()=>{card.style.opacity='1';});
+
+  const top = _E('div','display:flex;justify-content:space-between;align-items:center;margin-bottom:8px');
+  const coinE = _E('div','font-family:"Space Mono",monospace;font-size:14px;font-weight:700;color:'+(s.side==='LONG'?C.green:C.red));
+  coinE.textContent = s.coin+' '+s.side;
+  const badge = _E('div','font-family:"Space Mono",monospace;font-size:11px;font-weight:700;color:'+sc+';background:'+sc+'22;padding:3px 8px;border-radius:6px');
+  badge.textContent = s.signal;
+  top.appendChild(coinE); top.appendChild(badge); card.appendChild(top);
+
+  const dots = _E('div','display:flex;gap:5px;align-items:center;margin-bottom:8px');
+  [1,2,3,4,5].forEach(i=>{
+    const d=_E('div','width:6px;height:6px;border-radius:50%;background:'+(s.gates['g'+i]?C.green:C.border));
+    dots.appendChild(d);
+  });
+  const scoreE = _E('span','font-size:11px;color:'+sc+';margin-left:6px');
+  scoreE.textContent = s.gateScore+'/5';
+  dots.appendChild(scoreE); card.appendChild(dots);
+
+  const meta = _E('div','font-size:11px;color:'+C.muted+';display:flex;gap:12px');
+  ['RSI '+s.rsi,'F '+s.funding+'%','T '+s.takerRatio].forEach(t=>{
+    const sp=_E('span'); sp.textContent=t; meta.appendChild(sp);
+  });
+  card.appendChild(meta);
+  return card;
+}
+
+/* Geçmiş listesi */
+function _buildHistorySection() {
+  const sec = _E('div', 'padding:12px');
+  const hdr = _E('div', 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px');
+  const ttl = _E('div', 'font-size:11px;color:'+C.muted+';letter-spacing:1px');
+  ttl.textContent = 'İŞLEM GEÇMİŞİ';
+  hdr.appendChild(ttl); sec.appendChild(hdr);
+
+  _histListEl = _E('div', 'display:flex;flex-direction:column;gap:6px');
+  sec.appendChild(_histListEl);
+  _renderHistory();
+  return sec;
+}
+
+function _renderHistory() {
+  if (!_histListEl) return;
+  while (_histListEl.firstChild) _histListEl.removeChild(_histListEl.firstChild);
+  const history = getTodayHistory().slice(0, 20); // son 20
+  if (!history.length) {
+    const e = _E('div','text-align:center;color:'+C.muted+';font-size:12px;padding:12px');
+    e.textContent = 'Henüz kapanan işlem yok'; _histListEl.appendChild(e); return;
+  }
+  history.forEach(t => {
+    const pnlColor = t.pnl>=0 ? C.green : C.red;
+    const reasonColor = t.reason==='tp'?C.green:t.reason==='sl'?C.red:C.muted;
+    const card = _E('div','display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;padding:8px 10px;background:'+C.panel+';border-radius:8px;border:1px solid '+C.border);
+
+    const left = _E('div');
+    const coinL = _E('div','font-family:"Space Mono",monospace;font-size:12px;font-weight:700;color:'+(t.side==='LONG'?C.green:C.red));
+    coinL.textContent = t.coin+' '+t.side+(t.isAuto?' ⚡':'');
+    const meta = _E('div','font-size:10px;color:'+C.muted+';margin-top:2px');
+    const dur  = t.duration ? Math.round(t.duration/1000)+'s' : '—';
+    meta.textContent = _fmtP(t.entry)+' → '+_fmtP(t.exitPrice)+'  '+dur;
+    left.appendChild(coinL); left.appendChild(meta);
+
+    const pnlEl = _E('div','font-family:"Space Mono",monospace;font-size:13px;font-weight:700;color:'+pnlColor+';text-align:right');
+    pnlEl.textContent = (t.pnl>=0?'+':'')+'$'+t.pnl.toFixed(2);
+
+    const reasonEl = _E('div','font-size:10px;font-weight:700;color:'+reasonColor+';text-align:right;text-transform:uppercase');
+    reasonEl.textContent = t.reason==='tp'?'TP':t.reason==='sl'?'SL':'MAN';
+
+    card.appendChild(left); card.appendChild(pnlEl); card.appendChild(reasonEl);
+    _histListEl.appendChild(card);
+  });
+}
+
+/* ═══════════════════════════════════════════════
+   11. UI / MODAL (setup detayı)
+   ═══════════════════════════════════════════════ */
+
+let _overlay = null;
+
+function openModal(setup) {
+  closeModal();
+  _overlay = _buildOverlay(setup);
+  document.body.appendChild(_overlay);
+  const onKey = e => { if(e.key==='Escape') closeModal(); };
+  document.addEventListener('keydown', onKey, { once: true });
+  _overlay._onKey = onKey;
+  _overlay.addEventListener('click', e => { if(e.target===_overlay) closeModal(); });
+}
+
+function closeModal() {
+  if (!_overlay) return;
+  if (_overlay._onKey) document.removeEventListener('keydown', _overlay._onKey);
+  _overlay.remove(); _overlay = null;
+}
+
+function _buildOverlay(s) {
+  const ov = _E('div','position:fixed;inset:0;background:rgba(0,0,0,0.75);display:flex;align-items:flex-end;z-index:1000');
+  const panel = _E('div','background:'+C.panel+';border-top:1px solid '+C.border+';border-radius:16px 16px 0 0;width:100%;max-height:90vh;overflow-y:auto;padding:20px 16px 32px;font-family:"DM Sans",sans-serif;color:'+C.text);
+
+  // Header
+  const hdr = _E('div','display:flex;justify-content:space-between;align-items:center;margin-bottom:16px');
+  const hl  = _E('div');
+  const ct  = _E('div','font-family:"Space Mono",monospace;font-size:20px;font-weight:700;color:'+(s.side==='LONG'?C.green:C.red));
+  ct.textContent = s.coin+' '+s.side;
+  const cm  = _E('div','font-size:12px;color:'+C.muted+';margin-top:4px');
+  cm.textContent = 'RSI '+s.rsi+' · Funding '+s.funding+'% · Taker '+s.takerRatio;
+  hl.appendChild(ct); hl.appendChild(cm);
+  const xBtn = _E('button','background:none;border:none;color:'+C.muted+';font-size:24px;cursor:pointer;padding:4px 8px');
+  xBtn.textContent='✕'; xBtn.addEventListener('click', closeModal);
+  hdr.appendChild(hl); hdr.appendChild(xBtn); panel.appendChild(hdr);
+
+  // Gates
+  const gt = _E('div','margin-bottom:16px');
+  const gtl = _E('div','font-size:11px;color:'+C.muted+';letter-spacing:1px;margin-bottom:8px');
+  gtl.textContent='GATE ANALİZİ'; gt.appendChild(gtl);
+  const gg = _E('div','display:grid;grid-template-columns:1fr 1fr;gap:6px');
+  ['G1 Funding','G2 OI Yönü','G3 Taker Oranı','G4 RSI + Momentum','G5 Volume Spike'].forEach((lbl,i) => {
+    const gKey=`g${i+1}`, ok=s.gates[gKey], reason=!ok&&s.gateReasons?s.gateReasons[gKey]:'';
+    const row = _E('div','display:flex;align-items:flex-start;gap:8px;background:#111d2b;border-radius:8px;padding:8px 10px;border:1px solid '+(ok?C.green+'33':C.border));
+    const ic  = _E('span','font-size:14px;color:'+(ok?C.green:C.red)+';flex-shrink:0;margin-top:1px'); ic.textContent=ok?'✓':'✗';
+    const txw = _E('div');
+    const tx  = _E('div','font-size:12px;color:'+(ok?C.text:C.muted)); tx.textContent=lbl; txw.appendChild(tx);
+    if (!ok && reason) { const rs=_E('div','font-size:10px;color:'+C.red+';margin-top:2px'); rs.textContent=reason; txw.appendChild(rs); }
+    row.appendChild(ic); row.appendChild(txw); gg.appendChild(row);
+  });
+  const sb = _E('div','grid-column:1/-1;text-align:center;padding:8px;border-radius:8px;font-family:"Space Mono",monospace;font-weight:700;font-size:13px;background:'+(s.gateScore===5?C.green+'22':s.gateScore===4?C.yellow+'22':C.red+'11')+';color:'+(s.gateScore===5?C.green:s.gateScore===4?C.yellow:C.red));
+  sb.textContent=s.gateScore+'/5 — '+s.signal;
+  gg.appendChild(sb); gt.appendChild(gg); panel.appendChild(gt);
+
+  // Kaldıraç seçici
+  let selectedLeverage=10, selectedSize=100;
+
+  const levSec = _E('div','margin-bottom:12px');
+  const levLbl = _E('div','font-size:11px;color:'+C.muted+';letter-spacing:1px;margin-bottom:8px');
+  levLbl.textContent='KALDIRAÇ'; levSec.appendChild(levLbl);
+  const levRow = _E('div','display:flex;gap:8px');
+  const levBtns = [5,10,20].map(lv => {
+    const a=lv===10;
+    const btn=_E('button','flex:1;padding:9px;border-radius:8px;font-family:"Space Mono",monospace;font-size:13px;font-weight:700;cursor:pointer;transition:all 0.15s;border:1px solid '+(a?C.purple:C.border)+';background:'+(a?C.purple+'22':'transparent')+';color:'+(a?C.purple:C.muted));
+    btn.textContent=lv+'x';
+    btn.addEventListener('click',()=>{ selectedLeverage=lv; levBtns.forEach((b,i)=>{ const aa=[5,10,20][i]===lv; b.style.background=aa?C.purple+'22':'transparent'; b.style.color=aa?C.purple:C.muted; b.style.borderColor=aa?C.purple:C.border; }); _refresh(); });
+    levRow.appendChild(btn); return btn;
+  });
+  levSec.appendChild(levRow); panel.appendChild(levSec);
+
+  // Boyut seçici
+  const esSec = _E('div','margin-bottom:12px');
+  const esl   = _E('div','font-size:11px;color:'+C.muted+';letter-spacing:1px;margin-bottom:8px');
+  esl.textContent='POZİSYON BOYUTU'; esSec.appendChild(esl);
+  const szRow  = _E('div','display:flex;gap:8px');
+  const szBtns = [100,200,300].map(sz => {
+    const a=sz===100;
+    const btn=_E('button','flex:1;padding:10px;border-radius:8px;font-family:"Space Mono",monospace;font-size:13px;font-weight:700;cursor:pointer;transition:all 0.15s;border:1px solid '+(a?C.blue:C.border)+';background:'+(a?C.blue+'22':'transparent')+';color:'+(a?C.blue:C.muted));
+    btn.textContent='$'+sz;
+    btn.addEventListener('click',()=>{ selectedSize=sz; szBtns.forEach((b,i)=>{ const aa=[100,200,300][i]===sz; b.style.background=aa?C.blue+'22':'transparent'; b.style.color=aa?C.blue:C.muted; b.style.borderColor=aa?C.blue:C.border; }); _refresh(); });
+    szRow.appendChild(btn); return btn;
+  });
+  esSec.appendChild(szRow); panel.appendChild(esSec);
+
+  // Dinamik hesap tablosu
+  const ctSec = _E('div','margin-bottom:20px');
+  const ctl   = _E('div','font-size:11px;color:'+C.muted+';letter-spacing:1px;margin-bottom:8px');
+  ctl.textContent='TP / SL HESABI'; ctSec.appendChild(ctl);
+  const ctBody = _E('div'); ctSec.appendChild(ctBody); panel.appendChild(ctSec);
+
+  function _refresh() {
+    while (ctBody.firstChild) ctBody.removeChild(ctBody.firstChild);
+    const price = state.get('prices')[s.coin] ?? s.price;
+    try {
+      const calc    = calculate({ entry:price, size:selectedSize, leverage:selectedLeverage, side:s.side });
+      const tpPct   = _r(Math.abs(calc.tp-price)/price*100, 3);
+      const slPct   = _r(Math.abs(calc.sl-price)/price*100, 3);
+
+      const tpRow = _E('div','padding:12px;background:#0d1e10;border-radius:8px;border:1px solid '+C.green+'44;margin-bottom:6px');
+      const tpLbl = _E('div','font-size:10px;color:'+C.muted+';letter-spacing:1px;margin-bottom:4px'); tpLbl.textContent='TAKE PROFIT';
+      const tpVal = _E('div','font-family:"Space Mono",monospace;font-size:22px;font-weight:700;color:'+C.green); tpVal.textContent=_fmtP(calc.tp);
+      const tpMeta= _E('div','font-size:11px;color:'+C.muted+';margin-top:4px'); tpMeta.textContent='+'+tpPct+'%  ·  fee $'+calc.totalFee.toFixed(3);
+      tpRow.appendChild(tpLbl); tpRow.appendChild(tpVal); tpRow.appendChild(tpMeta); ctBody.appendChild(tpRow);
+
+      const slRow = _E('div','padding:12px;background:#1e0d10;border-radius:8px;border:1px solid '+C.red+'44;margin-bottom:6px');
+      const slLbl = _E('div','font-size:10px;color:'+C.muted+';letter-spacing:1px;margin-bottom:4px'); slLbl.textContent='STOP LOSS';
+      const slVal = _E('div','font-family:"Space Mono",monospace;font-size:18px;font-weight:700;color:'+C.red); slVal.textContent=_fmtP(calc.sl);
+      const slMeta= _E('div','font-size:11px;color:'+C.muted+';margin-top:4px'); slMeta.textContent='-'+slPct+'%  ·  RR 1:'+_r(1/calc.riskReward,2);
+      slRow.appendChild(slLbl); slRow.appendChild(slVal); slRow.appendChild(slMeta); ctBody.appendChild(slRow);
+
+      const sum = _E('div','display:flex;justify-content:space-between;padding:8px 10px;background:#111d2b;border-radius:8px;font-family:"Space Mono",monospace;font-size:11px;color:'+C.muted);
+      ['Giriş '+_fmtP(price), 'x'+selectedLeverage, '$'+selectedSize].forEach(t=>{ const sp=_E('span'); sp.textContent=t; sum.appendChild(sp); });
+      ctBody.appendChild(sum);
+    } catch(e) {
+      const err=_E('div','color:'+C.red+';font-size:12px;padding:8px'); err.textContent=e.message; ctBody.appendChild(err);
+    }
+  }
+  _refresh();
+
+  // Giriş butonu
+  const posCount = state.get('positions').length;
+  const isFull   = posCount >= 5;
+  const entryBtn = _E('button','width:100%;padding:16px;border-radius:12px;border:none;font-family:"Space Mono",monospace;font-size:15px;font-weight:700;cursor:'+(isFull?'not-allowed':'pointer')+';background:'+(isFull?C.border:s.side==='LONG'?C.green:C.red)+';color:'+(isFull?C.muted:'#000')+';letter-spacing:1px');
+  entryBtn.textContent = isFull ? '✕ 5 POZİSYON DOLU' : (s.side==='LONG'?'▲':'▼')+' GİRİŞ YAP — '+s.coin;
+
+  if (!isFull) {
+    entryBtn.addEventListener('click', () => {
+      const entry = state.get('prices')[s.coin] ?? s.price;
+      try {
+        const calc = calculate({ entry, size:selectedSize, leverage:selectedLeverage, side:s.side });
+        // Ayarları kaydet (oto mod için)
+        storage.set('settings', { size: selectedSize, leverage: selectedLeverage });
+        const pos = openAndTrack({ coin:s.coin, side:s.side, entry, size:selectedSize, leverage:selectedLeverage, tp:calc.tp, sl:calc.sl, gateScore:s.gateScore });
+        if (!pos) { alert('5 pozisyon limiti doldu!'); return; }
+        alertEntry(); closeModal();
+      } catch(e) { alert(e.message); }
+    });
+  }
+  panel.appendChild(entryBtn);
+  ov.appendChild(panel);
+  return ov;
+}
+
+/* ═══════════════════════════════════════════════
+   11B. UI / EDIT POZİSYON MODALİ
+   ═══════════════════════════════════════════════ */
+
+let _editOverlay = null;
+
+function openEditPositionModal(pos) {
+  if (_editOverlay) _editOverlay.remove();
+  _editOverlay = _buildEditOverlay(pos);
+  document.body.appendChild(_editOverlay);
+  const onKey = e => { if(e.key==='Escape') closeEditModal(); };
+  document.addEventListener('keydown', onKey, { once: true });
+  _editOverlay._onKey = onKey;
+  _editOverlay.addEventListener('click', e => { if(e.target===_editOverlay) closeEditModal(); });
+}
+
+function closeEditModal() {
+  if (!_editOverlay) return;
+  if (_editOverlay._onKey) document.removeEventListener('keydown', _editOverlay._onKey);
+  _editOverlay.remove(); _editOverlay = null;
+}
+
+function _buildEditOverlay(pos) {
+  const ov = _E('div','position:fixed;inset:0;background:rgba(0,0,0,0.75);display:flex;align-items:flex-end;z-index:1000');
+  const panel = _E('div','background:'+C.panel+';border-top:1px solid '+C.border+';border-radius:16px 16px 0 0;width:100%;max-height:85vh;overflow-y:auto;padding:20px 16px 32px;font-family:"DM Sans",sans-serif;color:'+C.text);
+
+  // Header
+  const hdr = _E('div','display:flex;justify-content:space-between;align-items:center;margin-bottom:20px');
+  const ttl = _E('div','font-family:"Space Mono",monospace;font-size:18px;font-weight:700;color:'+C.blue);
+  ttl.textContent = 'POZİSYON DÜZENLE';
+  const xBtn = _E('button','background:none;border:none;color:'+C.muted+';font-size:24px;cursor:pointer');
+  xBtn.textContent='✕'; xBtn.addEventListener('click', closeEditModal);
+  hdr.appendChild(ttl); hdr.appendChild(xBtn); panel.appendChild(hdr);
+
+  // Pozisyon info
+  const infoSec = _E('div','background:#111d2b;border-radius:10px;padding:14px;margin-bottom:16px');
+  const infGrid = _E('div','display:grid;grid-template-columns:1fr 1fr;gap:10px');
+
+  const infItems = [
+    ['Coin/Yön', pos.coin + ' ' + pos.side, (pos.side==='LONG'?C.green:C.red)],
+    ['Kaldıraç', '×' + pos.leverage, C.muted],
+    ['Boyut', '$' + pos.size, C.yellow],
+    ['Giriş', _fmtP(pos.entry), C.text],
+    ['Anlık', _fmtP(pos.currentPrice ?? pos.entry), pos.unrealizedPnl>=0?C.green:C.red],
+    ['PnL', (pos.unrealizedPnl>=0?'+':'')+'$'+pos.unrealizedPnl.toFixed(2), pos.unrealizedPnl>=0?C.green:C.red],
+  ];
+
+  infItems.forEach(([label, value, color]) => {
+    const cell = _E('div');
+    const lbl = _E('div','font-size:10px;color:'+C.muted+';margin-bottom:4px'); lbl.textContent=label;
+    const val = _E('div','font-family:"Space Mono",monospace;font-size:13px;font-weight:700;color:'+color); val.textContent=value;
+    cell.appendChild(lbl); cell.appendChild(val);
+    infGrid.appendChild(cell);
+  });
+  infoSec.appendChild(infGrid); panel.appendChild(infoSec);
+
+  // TP/SL kontrol
+  let newTp = pos.tp, newSl = pos.sl;
+  const tpslSec = _E('div','margin-bottom:16px');
+
+  // TP slider
+  const tpLbl = _E('div','font-size:11px;color:'+C.muted+';letter-spacing:1px;margin-bottom:8px');
+  tpLbl.textContent = 'TAKE PROFIT';
+  const tpRow = _E('div','display:flex;gap:8px;align-items:center');
+  const tpVal = _E('div','font-family:"Space Mono",monospace;font-size:16px;font-weight:700;color:'+C.green+';min-width:80px;text-align:right');
+  tpVal.textContent = _fmtP(newTp);
+  const tpSlider = _E('input');
+  tpSlider.type = 'range';
+  tpSlider.min = (_r(pos.entry*0.95, 8)).toString();
+  tpSlider.max = (_r(pos.entry*1.1, 8)).toString();
+  tpSlider.step = (_r(Math.abs(pos.entry*0.001), 8)).toString();
+  tpSlider.value = newTp.toString();
+  tpSlider.style.cssText = 'flex:1;cursor:pointer;height:6px;background:'+C.border+';border-radius:3px;outline:none;-webkit-appearance:slider-horizontal;';
+  tpSlider.addEventListener('input', e => {
+    newTp = parseFloat(e.target.value);
+    tpVal.textContent = _fmtP(newTp);
+  });
+  tpRow.appendChild(tpVal); tpRow.appendChild(tpSlider); tpSec = _E('div'); tpSec.appendChild(tpLbl); tpSec.appendChild(tpRow); var tpSec;
+  tpslSec.appendChild(tpSec);
+
+  // SL slider
+  const slLbl = _E('div','font-size:11px;color:'+C.muted+';letter-spacing:1px;margin-bottom:8px;margin-top:12px');
+  slLbl.textContent = 'STOP LOSS';
+  const slRow = _E('div','display:flex;gap:8px;align-items:center');
+  const slVal = _E('div','font-family:"Space Mono",monospace;font-size:16px;font-weight:700;color:'+C.red+';min-width:80px;text-align:right');
+  slVal.textContent = _fmtP(newSl);
+  const slSlider = _E('input');
+  slSlider.type = 'range';
+  slSlider.min = (_r(pos.entry*0.85, 8)).toString();
+  slSlider.max = (_r(pos.entry*1.05, 8)).toString();
+  slSlider.step = (_r(Math.abs(pos.entry*0.001), 8)).toString();
+  slSlider.value = newSl.toString();
+  slSlider.style.cssText = 'flex:1;cursor:pointer;height:6px;background:'+C.border+';border-radius:3px;outline:none;-webkit-appearance:slider-horizontal;';
+  slSlider.addEventListener('input', e => {
+    newSl = parseFloat(e.target.value);
+    slVal.textContent = _fmtP(newSl);
+  });
+  slRow.appendChild(slVal); slRow.appendChild(slSlider); slSec = _E('div'); slSec.appendChild(slLbl); slSec.appendChild(slRow); var slSec;
+  tpslSec.appendChild(slSec);
+
+  panel.appendChild(tpslSec);
+
+  // Butonlar
+  const btnRow = _E('div','display:flex;gap:8px;margin-bottom:12px');
+
+  const updateBtn = _E('button','flex:1;padding:12px;border-radius:10px;border:none;font-family:"Space Mono",monospace;font-size:13px;font-weight:700;cursor:pointer;background:'+C.blue+';color:#000');
+  updateBtn.textContent = 'Güncelle';
+  updateBtn.addEventListener('click', () => {
+    const p = state.get('positions').find(x => x.id === pos.id);
+    if (!p) return;
+    // TP/SL güncelle, SL warning state'i sıfırla
+    _slWarnFired[pos.id] = false;
+    state.setState({ positions: state.get('positions').map(x => x.id===pos.id ? {...x, tp:newTp, sl:newSl} : x) });
+    closeEditModal();
+  });
+
+  const closeBtn = _E('button','flex:1;padding:12px;border-radius:10px;border:1px solid '+C.border+';background:transparent;color:'+C.red+';font-weight:700;font-size:13px;cursor:pointer');
+  closeBtn.textContent = 'Manuel Kapat';
+  closeBtn.addEventListener('click', () => {
+    closeManually(pos.id);
+    closeEditModal();
+  });
+
+  btnRow.appendChild(updateBtn); btnRow.appendChild(closeBtn);
+  panel.appendChild(btnRow);
+
+  ov.appendChild(panel);
+  return ov;
+}
+
+/* ═══════════════════════════════════════════════
+   12. UI / RAPOR MODALİ
+   ═══════════════════════════════════════════════ */
+
+let _reportOverlay = null;
+
+function openReportModal() {
+  if (_reportOverlay) { _reportOverlay.remove(); _reportOverlay = null; return; }
+  const rep = getDailyReport();
+
+  const ov = _E('div','position:fixed;inset:0;background:rgba(0,0,0,0.8);display:flex;align-items:flex-end;z-index:2000');
+  const panel = _E('div','background:'+C.panel+';border-top:1px solid '+C.border+';border-radius:16px 16px 0 0;width:100%;max-height:80vh;overflow-y:auto;padding:20px 16px 40px;font-family:"DM Sans",sans-serif;color:'+C.text);
+
+  const hdr = _E('div','display:flex;justify-content:space-between;align-items:center;margin-bottom:20px');
+  const htl = _E('div','font-family:"Space Mono",monospace;font-size:16px;font-weight:700;color:'+C.yellow);
+  htl.textContent = 'GÜNLÜK RAPOR';
+  const xB = _E('button','background:none;border:none;color:'+C.muted+';font-size:24px;cursor:pointer');
+  xB.textContent='✕'; xB.addEventListener('click',()=>{ ov.remove(); _reportOverlay=null; });
+  hdr.appendChild(htl); hdr.appendChild(xB); panel.appendChild(hdr);
+
+  if (!rep) {
+    const e = _E('div','text-align:center;color:'+C.muted+';padding:32px;font-size:14px');
+    e.textContent = 'Bugün henüz kapanan işlem yok.'; panel.appendChild(e);
+  } else {
+    const stats = [
+      ['Toplam İşlem', rep.total, C.text],
+      ['Kazanan', rep.winners, C.green],
+      ['Kaybeden', rep.losers, C.red],
+      ['Win Rate', rep.winRate+'%', rep.winRate>=50?C.green:C.red],
+      ['Net PnL', (rep.netPnl>=0?'+':'')+'$'+rep.netPnl, rep.netPnl>=0?C.green:C.red],
+      ['Ort. Süre', _fmtDur(rep.avgDur), C.muted],
+    ];
+    const grid = _E('div','display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px');
+    stats.forEach(([label, value, color]) => {
+      const cell = _E('div','background:#111d2b;border-radius:10px;padding:12px');
+      const lbl  = _E('div','font-size:10px;color:'+C.muted+';letter-spacing:1px;margin-bottom:6px'); lbl.textContent=label;
+      const val  = _E('div','font-family:"Space Mono",monospace;font-size:20px;font-weight:700;color:'+color); val.textContent=value;
+      cell.appendChild(lbl); cell.appendChild(val); grid.appendChild(cell);
+    });
+    panel.appendChild(grid);
+
+    if (rep.best) {
+      const bestSec = _buildTradeSummaryRow('En İyi İşlem', rep.best, C.green);
+      panel.appendChild(bestSec);
+    }
+    if (rep.worst) {
+      const worstSec = _buildTradeSummaryRow('En Kötü İşlem', rep.worst, C.red);
+      panel.appendChild(worstSec);
+    }
+  }
+
+  ov.addEventListener('click', e => { if(e.target===ov) { ov.remove(); _reportOverlay=null; } });
+  ov.appendChild(panel);
+  document.body.appendChild(ov);
+  _reportOverlay = ov;
+}
+
+function _buildTradeSummaryRow(title, trade, color) {
+  const sec  = _E('div','background:#111d2b;border-radius:10px;padding:12px;margin-bottom:8px');
+  const ttl  = _E('div','font-size:10px;color:'+C.muted+';letter-spacing:1px;margin-bottom:6px'); ttl.textContent=title;
+  const main = _E('div','display:flex;justify-content:space-between;align-items:center');
+  const coin = _E('div','font-family:"Space Mono",monospace;font-size:13px;font-weight:700;color:'+(trade.side==='LONG'?C.green:C.red));
+  coin.textContent = trade.coin+' '+trade.side;
+  const pnl  = _E('div','font-family:"Space Mono",monospace;font-size:16px;font-weight:700;color:'+color);
+  pnl.textContent = (trade.pnl>=0?'+':'')+'$'+trade.pnl.toFixed(2);
+  main.appendChild(coin); main.appendChild(pnl);
+  const meta = _E('div','font-size:11px;color:'+C.muted+';margin-top:4px');
+  meta.textContent = _fmtP(trade.entry)+' → '+_fmtP(trade.exitPrice)+'  '+_fmtDur(Math.round((trade.duration||0)/1000))+'  '+( trade.reason==='tp'?'✓ TP':trade.reason==='sl'?'✗ SL':'⊘ Manuel');
+  sec.appendChild(ttl); sec.appendChild(main); sec.appendChild(meta);
+  return sec;
+}
+
+function _fmtDur(secs) {
+  const m=Math.floor(secs/60), s=secs%60;
+  return m>0 ? m+'dk '+s+'s' : s+'s';
+}
+
+/* ═══════════════════════════════════════════════
+   YARDIMCI
+   ═══════════════════════════════════════════════ */
+
+function _fmtP(p) {
+  if (!p && p!==0) return '—';
+  if (p>=1000) return p.toFixed(2);
+  if (p>=1)    return p.toFixed(4);
+  return p.toFixed(6);
+}
+
+/* ═══════════════════════════════════════════════
+   13. UYGULAMA BAŞLATMA
+   ═══════════════════════════════════════════════ */
+
+function initApp() {
+  initAudio();
+  initCounter();
+
+  const root = document.getElementById('app');
+  mountDashboard(root);
+
+  state.on('counter:target_reached', () => alertTargetReached());
+  state.on('position:overtime',      () => alertReady());
+  state.on('history:updated',        () => _renderHistory());
+
+  connectWs();
+  startScanner(60000);
+}
+
+document.addEventListener('DOMContentLoaded', initApp);
+</script>
+
+<script>
+/* ═══════════════════════════════════════════════
+   PWA — Manifest + Service Worker
+   ═══════════════════════════════════════════════ */
+(function() {
+  const manifest = {
+    name:'SpooXo V11 Extreme', short_name:'SpooXo',
+    description:'Binance Futures scalping karar destek terminali',
+    start_url:'/', display:'standalone', orientation:'portrait',
+    background_color:'#060a0f', theme_color:'#060a0f',
+    icons:[
+      { src:'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192"><rect width="192" height="192" fill="%23060a0f" rx="24"/><text x="96" y="130" text-anchor="middle" font-size="100" fill="%2300ff88">⚡</text></svg>', sizes:'192x192', type:'image/svg+xml' },
+      { src:'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" fill="%23060a0f" rx="64"/><text x="256" y="340" text-anchor="middle" font-size="280" fill="%2300ff88">⚡</text></svg>', sizes:'512x512', type:'image/svg+xml' }
+    ],
+  };
+  const mBlob = new Blob([JSON.stringify(manifest)], { type:'application/manifest+json' });
+  const link  = document.createElement('link'); link.rel='manifest'; link.href=URL.createObjectURL(mBlob);
+  document.head.appendChild(link);
+
+  if ('serviceWorker' in navigator) {
+    const swCode = `
+const CACHE='spxv11-v2';
+self.addEventListener('install', e=>{ e.waitUntil(caches.open(CACHE).then(c=>c.addAll(['/']))); self.skipWaiting(); });
+self.addEventListener('activate', e=>{ e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k))))); self.clients.claim(); });
+self.addEventListener('fetch', e=>{
+  if (e.request.method!=='GET') return;
+  const u=new URL(e.request.url);
+  if (u.hostname.includes('binance')||u.hostname.includes('googleapis')) return;
+  e.respondWith(caches.match(e.request).then(c=>c||fetch(e.request)));
+});`;
+    const swBlob = new Blob([swCode], { type:'application/javascript' });
+    navigator.serviceWorker.register(URL.createObjectURL(swBlob)).catch(()=>{});
+  }
+})();
+</script>
+</body>
+</html>

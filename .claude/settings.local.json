@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx localtunnel:*)",
+      "Bash(ipconfig)",
+      "Bash(node -c \"/c/Users/lepur/SpooXoV11Extreme/index.html\")",
+      "Bash(curl -s http://127.0.0.1:8000)"
+    ]
+  }
+}
